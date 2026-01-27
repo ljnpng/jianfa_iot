@@ -1,5 +1,6 @@
 """Data coordinator for C&D Iot integration."""
 
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Any, Dict, Optional, Set
@@ -43,6 +44,12 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
 
         # For storing the last known value separately from the data
         self._previous_data: Dict[str, Any] = {}
+
+        # Verification state management
+        self._verification_results: Dict[str, str] = {}  # {f"{device_id}_{property}": "confirmed" | "timeout"}
+        self._verification_queue: asyncio.Queue = asyncio.Queue()
+        self._verification_task: asyncio.Task | None = None
+        self._verification_lock = asyncio.Lock()
 
     @callback
     def async_get_device_state(self, device_id: str) -> Dict[str, Any]:
