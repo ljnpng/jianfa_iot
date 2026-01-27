@@ -402,3 +402,103 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
             key,
             expected_value,
         )
+
+    async def async_send_command_with_verify(
+        self,
+        device_id: str,
+        property_code: str,
+        value: Any,
+    ) -> bool:
+        """Send command and start background verification.
+
+        Args:
+            device_id: Device identifier
+            property_code: Property to control
+            value: Value to set
+
+        Returns:
+            True if command was sent successfully (does not wait for verification)
+        """
+        if device_id not in self._device_ids:
+            _LOGGER.error("Device %s not registered to coordinator", device_id)
+            return False
+
+        if device_id not in self._device_info:
+            _LOGGER.error("Device %s info incomplete", device_id)
+            return False
+
+        device_info = self._device_info[device_id]
+        key = f"{device_id}_{property_code}"
+
+        try:
+            # Send the command
+            success = await self._http_client.send_command(
+                room=self._room,
+                property_code=property_code,
+                value=value,
+                device_id=device_id,
+                device_name=device_info.get("device_name", ""),
+                product_id=device_info.get("product_id", ""),
+            )
+
+            if success:
+                # Queue verification task
+                await self._verification_queue.put((device_id, property_code, value))
+
+                # Ensure queue processor is running
+                if self._verification_task is None or self._verification_task.done():
+                    self._verification_task = asyncio.create_task(
+                        self._verification_queue_processor()
+                    )
+                    _LOGGER.debug("Started verification queue processor")
+
+                _LOGGER.debug(
+                    "Command sent for %s, verification queued",
+                    key,
+                )
+                return True
+
+            return False
+
+        except Exception as error:
+            _LOGGER.error(
+                "Failed to send command for %s with value %s: %s",
+                key,
+                value,
+                error,
+            )
+            return False
+
+    def is_verification_confirmed(
+        self,
+        device_id: str,
+        property_code: str,
+    ) -> bool:
+        """Check if verification has been confirmed successful.
+
+        Args:
+            device_id: Device identifier
+            property_code: Property code
+
+        Returns:
+            True if verification confirmed, False otherwise
+        """
+        key = f"{device_id}_{property_code}"
+        return self._verification_results.get(key) == "confirmed"
+
+    def get_verification_status(
+        self,
+        device_id: str,
+        property_code: str,
+    ) -> str | None:
+        """Get verification status for a device property.
+
+        Args:
+            device_id: Device identifier
+            property_code: Property code
+
+        Returns:
+            "confirmed" | "timeout" | None (not yet verified)
+        """
+        key = f"{device_id}_{property_code}"
+        return self._verification_results.get(key)
