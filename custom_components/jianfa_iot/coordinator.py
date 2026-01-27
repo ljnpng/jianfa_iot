@@ -316,3 +316,89 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
         await self.async_refresh()
         # 确保即使数据没有变化，也会通知监听者
         self.async_update_listeners()
+
+    async def _verification_queue_processor(self) -> None:
+        """Background task: Process verification queue sequentially.
+
+        Only one verification runs at a time to avoid API flooding.
+        Tasks are processed in FIFO order.
+        """
+        _LOGGER.info("Verification queue processor started")
+
+        while True:
+            # Get verification task from queue
+            device_id, property_code, expected_value = await self._verification_queue.get()
+
+            async with self._verification_lock:
+                await self._verify_with_exponential_backoff(
+                    device_id, property_code, expected_value
+                )
+
+            # Mark task as done
+            self._verification_queue.task_done()
+
+            # If queue is empty and we want to stop the processor, break here
+            # For now, keep it running indefinitely
+
+    async def _verify_with_exponential_backoff(
+        self,
+        device_id: str,
+        property_code: str,
+        expected_value: Any,
+    ) -> None:
+        """Verify device state change using exponential backoff polling.
+
+        Polls at intervals: 2s, 4s, 8s, 16s (total ~30s timeout)
+
+        Args:
+            device_id: Device identifier
+            property_code: Property being changed
+            expected_value: Expected value after command
+        """
+        key = f"{device_id}_{property_code}"
+        delays = [2, 4, 8, 16]
+
+        _LOGGER.debug(
+            "Starting verification for %s: expected %s",
+            key,
+            expected_value,
+        )
+
+        for delay in delays:
+            await asyncio.sleep(delay)
+
+            try:
+                # Force refresh to get latest state
+                await self.async_refresh()
+
+                # Check remote state
+                actual_value = self.async_get_device_property(device_id, property_code)
+
+                if actual_value == expected_value:
+                    # Verification successful
+                    self._verification_results[key] = "confirmed"
+                    _LOGGER.info(
+                        "Verification confirmed: %s = %s after %d seconds",
+                        key,
+                        expected_value,
+                        sum(delays[:delays.index(delay) + 1]),
+                    )
+                    return
+                else:
+                    _LOGGER.debug(
+                        "Verification pending for %s: expected %s, got %s",
+                        key,
+                        expected_value,
+                        actual_value,
+                    )
+
+            except Exception as e:
+                _LOGGER.warning("Verification query failed for %s: %s", key, e)
+
+        # Timeout - all delays exhausted
+        self._verification_results[key] = "timeout"
+        _LOGGER.warning(
+            "Verification timeout for %s: expected %s not confirmed after 30s",
+            key,
+            expected_value,
+        )
