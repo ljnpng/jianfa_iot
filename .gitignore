@@ -94,3 +94,6 @@ credentials.json
 # Debug
 *.log
 *.debug
+
+# Example Home Assistant data
+example/ha_data/home-assistant.log*
