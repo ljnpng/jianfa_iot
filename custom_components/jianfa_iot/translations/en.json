@@ -1,0 +1,38 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up C&D IoT",
+        "description": "Login with SMS verification"
+      },
+      "phone": {
+        "title": "Phone Number",
+        "data": {
+          "phone": "Phone Number"
+        }
+      },
+      "code": {
+        "title": "Verification Code",
+        "description": "Enter the SMS code sent to your phone",
+        "data": {
+          "code": "Verification Code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthentication Required",
+        "description": "Your token has expired. Please enter the SMS code.",
+        "data": {
+          "code": "Verification Code"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect",
+      "invalid_auth": "Invalid code",
+      "no_rooms": "No rooms found"
+    },
+    "abort": {
+      "reauth_successful": "Reauthentication successful"
+    }
+  }
+}

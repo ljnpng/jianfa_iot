@@ -1,0 +1,37 @@
+# Home Assistant Configuration
+
+# Home
+homeassistant:
+  name: Home
+  country: CN
+  language: zh-Hans
+  currency: CNY
+
+# Enable default integrations
+default_config:
+
+# Logger configuration for debugging
+logger:
+  default: info
+  logs:
+    custom_components.jianfa_iot: debug
+
+# Enable the frontend
+frontend:
+  themes: !include_dir_merge_named themes
+
+# HTTP settings
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+
+# Recorders
+recorder:
+  commit_interval: 5
+
+# Panels
+panel:
+  # my:
+  #   module: custom_components.my_panel

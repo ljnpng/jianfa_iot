@@ -1,0 +1,12 @@
+{
+  "domain": "jianfa_iot",
+  "name": "C&D Iot",
+  "version": "1.1.0",
+  "config_flow": true,
+  "documentation": "https://github.com/your_username/jianfa_iot",
+  "dependencies": ["http"],
+  "codeowners": ["@your_github_username"],
+  "requirements": ["aiohttp>=3.8.0", "async_timeout>=4.0.0"],
+  "iot_class": "local_polling",
+  "icon": "asset/icon.png"
+}

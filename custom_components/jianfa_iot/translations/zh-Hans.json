@@ -1,0 +1,38 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "设置 C&D IoT",
+        "description": "使用短信验证码登录"
+      },
+      "phone": {
+        "title": "手机号码",
+        "data": {
+          "phone": "手机号码"
+        }
+      },
+      "code": {
+        "title": "验证码",
+        "description": "请输入发送到您手机的短信验证码",
+        "data": {
+          "code": "验证码"
+        }
+      },
+      "reauth_confirm": {
+        "title": "需要重新认证",
+        "description": "您的令牌已过期，请输入短信验证码",
+        "data": {
+          "code": "验证码"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "连接失败",
+      "invalid_auth": "验证码错误",
+      "no_rooms": "未找到房间"
+    },
+    "abort": {
+      "reauth_successful": "重新认证成功"
+    }
+  }
+}
