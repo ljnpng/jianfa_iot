@@ -40,7 +40,6 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
         self._room = room  # Store room config
         self._device_ids: Set[str] = set()  # No default device ID
         self._device_info: Dict[str, Dict[str, str]] = {}  # Store device info
-        self._pending_updates: Dict[str, Any] = {}  # Track pending commands by property
 
         # For storing the last known value separately from the data
         self._previous_data: Dict[str, Any] = {}
@@ -167,9 +166,12 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
     async def async_send_command(
         self, device_id: str, property_code: str, value: Any
     ) -> bool:
-        """Send command to device and update state."""
-        pending_key = f"{device_id}_{property_code}"
+        """Send command to device.
 
+        .. deprecated::
+            Use async_send_command_with_verify instead.
+            This method does not track verification status.
+        """
         if device_id not in self._device_ids:
             _LOGGER.error("设备 %s 未注册到协调器", device_id)
             return False
@@ -187,9 +189,6 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
                 value,
                 device_id,
             )
-
-            # Record pending update
-            self._pending_updates[pending_key] = value
 
             # Send command with room config and device-specific information
             success = await self._http_client.send_command(
@@ -222,10 +221,6 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
                 error,
             )
             return False
-        finally:
-            # Clear the pending update regardless of outcome
-            if pending_key in self._pending_updates:
-                del self._pending_updates[pending_key]
 
     def register_device(
         self, device_id: str, device_name: str = "", product_id: str = ""
@@ -264,51 +259,6 @@ class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
     def get_current_data(self) -> Optional[DeviceList]:
         """Return the current data."""
         return self.data
-
-    def is_device_property_pending(self, device_id: str, property_code: str) -> bool:
-        """Check if a device property has a pending update."""
-        pending_key = f"{device_id}_{property_code}"
-        return pending_key in self._pending_updates
-
-    def get_pending_value(self, device_id: str, property_code: str) -> Any:
-        """Get the pending value for a property, if any."""
-        pending_key = f"{device_id}_{property_code}"
-        return self._pending_updates.get(pending_key)
-
-    async def async_get_remote_state(self, device_id: str, property_code: str) -> Any:
-        """获取设备的远程状态，专门用于验证本地状态与远程状态是否一致。
-
-        Args:
-            device_id: 设备ID
-            property_code: 要获取的属性代码
-
-        Returns:
-            当前属性的远程状态值，如果无法获取则返回None
-
-        Raises:
-            DeviceError: 如果无法获取设备状态
-        """
-        try:
-            pending_key = f"{device_id}_{property_code}"
-
-            # 如果有待处理的更新，优先返回本地状态
-            if pending_key in self._pending_updates:
-                _LOGGER.debug(
-                    "Using pending update value for %s: %s (command in progress)",
-                    property_code,
-                    self._pending_updates[pending_key],
-                )
-                return self._pending_updates[pending_key]
-
-            # Force refresh data
-            await self.async_refresh()
-
-            # Return the property value from refreshed data
-            return self.async_get_device_property(device_id, property_code)
-
-        except Exception as error:
-            _LOGGER.error("Failed to get remote state for %s: %s", property_code, error)
-            raise DeviceError(f"Failed to get remote state: {error}") from error
 
     async def async_force_refresh(self) -> None:
         """Force a refresh and immediately notify listeners."""
