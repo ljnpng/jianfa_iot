@@ -21,7 +21,14 @@ class DeviceState:
         
     @property
     def is_on(self) -> bool:
-        """Return if device is on."""
+        """Return if device is on.
+
+        Note: API returns PowerSwitch as string "0" or "1", or int 0/1.
+        We need to handle both cases correctly.
+        """
+        # Handle string "0"/"1" and int 0/1
+        if isinstance(self.power_switch, str):
+            return self.power_switch == "1"
         return bool(self.power_switch)
 
 
