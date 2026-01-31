@@ -4,22 +4,35 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from custom_components.jianfa_iot.coordinator import JianfaIotDataCoordinator
+from custom_components.jianfa_iot.coordinator import DeviceCoordinator
 from custom_components.jianfa_iot.light import HisenseLight
 from custom_components.jianfa_iot.models import Device, DeviceState
+
+
+def create_mock_hass():
+    """Create a mock Home Assistant instance."""
+    hass = MagicMock()
+    hass.data = {}
+    return hass
 
 
 @pytest.mark.asyncio
 async def test_light_turn_on_with_verification():
     """Test complete flow: turn on light with verification."""
     # Setup
-    hass = MagicMock()
+    hass = create_mock_hass()
     http_client = MagicMock()
     http_client.send_command = AsyncMock(return_value=True)
+    room = MagicMock()
 
-    coordinator = JianfaIotDataCoordinator(hass, http_client, MagicMock())
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="light_1",
+        device_name="Test Light",
+        product_id="connector.device.type.smartSwitch.c4",
+    )
 
-    # Create mock device
+    # Create mock device data
     device_data = {
         "deviceId": "light_1",
         "deviceName": "Test Light",
@@ -27,20 +40,19 @@ async def test_light_turn_on_with_verification():
         "currentState": '{"PowerSwitch": 0}',
     }
     device = Device(device_data)
-
-    coordinator.data = MagicMock()
-    coordinator.data.devices = [device]
-    coordinator.async_get_device_property = MagicMock(return_value=0)
+    coordinator.data = device
 
     # Create light entity
     light = HisenseLight(
         coordinator,
-        MagicMock(),
+        room,
         "Test Light",
         "light_1",
         "Test Light",
         "Living Room",
     )
+    # Mock hass attribute to avoid RuntimeError
+    light.hass = hass
 
     # Act - turn on
     await light.async_turn_on()
@@ -51,27 +63,25 @@ async def test_light_turn_on_with_verification():
     # Assert - command sent
     http_client.send_command.assert_called_once()
 
-    # Assert - verification queued
-    assert not coordinator._verification_queue.empty()
-
-    # Simulate verification success
-    coordinator.async_get_device_property = MagicMock(return_value=1)
-    await coordinator.async_refresh()
-
-    # Trigger coordinator update
-    light._handle_coordinator_update()
-
-    # Assert - light still on (state consistent)
-    assert light.is_on is True
+    # Assert - verification status is pending
+    assert coordinator.get_verification_status("PowerSwitch") == "pending"
 
 
 @pytest.mark.asyncio
 async def test_light_skips_update_when_verification_pending():
     """Test that entity ignores coordinator updates when verification is pending."""
     # Setup
-    hass = MagicMock()
+    hass = create_mock_hass()
     http_client = MagicMock()
-    coordinator = JianfaIotDataCoordinator(hass, http_client, MagicMock())
+    http_client.send_command = AsyncMock(return_value=True)
+    room = MagicMock()
+
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="light_1",
+        device_name="Test Light",
+        product_id="connector.device.type.smartSwitch.c4",
+    )
 
     # Create device with OFF state
     device_data = {
@@ -81,32 +91,75 @@ async def test_light_skips_update_when_verification_pending():
         "currentState": '{"PowerSwitch": 0}',
     }
     device = Device(device_data)
-
-    coordinator.data = MagicMock()
-    coordinator.data.devices = [device]
-    coordinator.async_get_device_property = MagicMock(return_value=0)
+    coordinator.data = device
 
     light = HisenseLight(
         coordinator,
-        MagicMock(),
+        room,
         "Test Light",
         "light_1",
         "Test Light",
         "Living Room",
     )
+    light.hass = hass
 
-    # Turn on (verification starts)
+    # Turn on (verification starts, status becomes "pending")
     await light.async_turn_on()
     assert light.is_on is True
 
-    # Verification is still pending (status = None)
-    assert coordinator.get_verification_status("light_1", "PowerSwitch") is None
+    # Verification is pending
+    assert coordinator.get_verification_status("PowerSwitch") == "pending"
 
-    # Coordinator returns old state (still 0)
-    coordinator.async_get_device_property = MagicMock(return_value=0)
-
-    # Trigger coordinator update
+    # Trigger coordinator update - should be ignored because pending
     light._handle_coordinator_update()
 
     # Assert - entity ignores the update, maintains optimistic state
+    assert light.is_on is True
+
+
+@pytest.mark.asyncio
+async def test_light_accepts_update_when_no_verification():
+    """Test that entity accepts coordinator updates when no verification is pending."""
+    # Setup
+    hass = create_mock_hass()
+    http_client = MagicMock()
+    room = MagicMock()
+
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="light_1",
+        device_name="Test Light",
+        product_id="connector.device.type.smartSwitch.c4",
+    )
+
+    # Create device with ON state
+    device_data = {
+        "deviceId": "light_1",
+        "deviceName": "Test Light",
+        "productId": "connector.device.type.smartSwitch.c4",
+        "currentState": '{"PowerSwitch": 1}',
+    }
+    device = Device(device_data)
+    coordinator.data = device
+
+    light = HisenseLight(
+        coordinator,
+        room,
+        "Test Light",
+        "light_1",
+        "Test Light",
+        "Living Room",
+    )
+    light.hass = hass
+
+    # Initially off (from init before data was set)
+    light._attr_is_on = False
+
+    # No verification pending (status is None)
+    assert coordinator.get_verification_status("PowerSwitch") is None
+
+    # Trigger coordinator update - should be accepted
+    light._handle_coordinator_update()
+
+    # Assert - entity accepts the update from coordinator
     assert light.is_on is True

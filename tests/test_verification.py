@@ -4,7 +4,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from custom_components.jianfa_iot.coordinator import JianfaIotDataCoordinator
+from custom_components.jianfa_iot.coordinator import DeviceCoordinator
 
 
 @pytest.mark.asyncio
@@ -14,21 +14,23 @@ async def test_send_command_with_verify_queues_verification():
     hass = MagicMock()
     http_client = MagicMock()
     http_client.send_command = AsyncMock(return_value=True)
+    room = MagicMock()
 
-    coordinator = JianfaIotDataCoordinator(hass, http_client, MagicMock())
-    coordinator.register_device("test_device", "Test Device", "product_123")
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="test_device",
+        device_name="Test Device",
+        product_id="product_123",
+    )
 
     # Act
-    result = await coordinator.async_send_command_with_verify(
-        "test_device", "PowerSwitch", 1
-    )
+    result = await coordinator.async_send_command_with_verify("PowerSwitch", 1)
 
     # Assert
     assert result is True
     assert not coordinator._verification_queue.empty()
 
-    device_id, property_code, value = coordinator._verification_queue.get_nowait()
-    assert device_id == "test_device"
+    property_code, value = coordinator._verification_queue.get_nowait()
     assert property_code == "PowerSwitch"
     assert value == 1
 
@@ -40,14 +42,17 @@ async def test_send_command_with_verify_starts_processor():
     hass = MagicMock()
     http_client = MagicMock()
     http_client.send_command = AsyncMock(return_value=True)
+    room = MagicMock()
 
-    coordinator = JianfaIotDataCoordinator(hass, http_client, MagicMock())
-    coordinator.register_device("test_device", "Test Device", "product_123")
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="test_device",
+        device_name="Test Device",
+        product_id="product_123",
+    )
 
     # Act
-    await coordinator.async_send_command_with_verify(
-        "test_device", "PowerSwitch", 1
-    )
+    await coordinator.async_send_command_with_verify("PowerSwitch", 1)
     await asyncio.sleep(0.1)  # Let task start
 
     # Assert
@@ -56,21 +61,29 @@ async def test_send_command_with_verify_starts_processor():
 
 
 @pytest.mark.asyncio
-async def test_is_verification_confirmed():
-    """Test verification status query."""
+async def test_verification_status_pending():
+    """Test verification status is set to pending when command is sent."""
     # Setup
     hass = MagicMock()
     http_client = MagicMock()
-    coordinator = JianfaIotDataCoordinator(hass, http_client, MagicMock())
+    http_client.send_command = AsyncMock(return_value=True)
+    room = MagicMock()
 
-    # Act & Assert - not verified yet
-    assert not coordinator.is_verification_confirmed("device1", "PowerSwitch")
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="device1",
+        device_name="Test Device",
+        product_id="product_123",
+    )
 
-    # Mark as confirmed
-    coordinator._verification_results["device1_PowerSwitch"] = "confirmed"
+    # Act & Assert - not set yet
+    assert coordinator.get_verification_status("PowerSwitch") is None
 
-    # Assert - now confirmed
-    assert coordinator.is_verification_confirmed("device1", "PowerSwitch")
+    # Send command - should set to pending
+    await coordinator.async_send_command_with_verify("PowerSwitch", 1)
+
+    # Assert - now pending
+    assert coordinator.get_verification_status("PowerSwitch") == "pending"
 
 
 @pytest.mark.asyncio
@@ -79,13 +92,26 @@ async def test_get_verification_status():
     # Setup
     hass = MagicMock()
     http_client = MagicMock()
-    coordinator = JianfaIotDataCoordinator(hass, http_client, MagicMock())
+    room = MagicMock()
 
-    # Act & Assert
-    assert coordinator.get_verification_status("device1", "PowerSwitch") is None
+    coordinator = DeviceCoordinator(
+        hass, http_client, room,
+        device_id="device1",
+        device_name="Test Device",
+        product_id="product_123",
+    )
 
-    coordinator._verification_results["device1_PowerSwitch"] = "confirmed"
-    assert coordinator.get_verification_status("device1", "PowerSwitch") == "confirmed"
+    # Act & Assert - None when not set
+    assert coordinator.get_verification_status("PowerSwitch") is None
 
-    coordinator._verification_results["device1_PowerSwitch"] = "timeout"
-    assert coordinator.get_verification_status("device1", "PowerSwitch") == "timeout"
+    # Set to pending
+    coordinator.set_verification_pending("PowerSwitch")
+    assert coordinator.get_verification_status("PowerSwitch") == "pending"
+
+    # Manually set to confirmed
+    coordinator._verification_status["PowerSwitch"] = "confirmed"
+    assert coordinator.get_verification_status("PowerSwitch") == "confirmed"
+
+    # Manually set to timeout
+    coordinator._verification_status["PowerSwitch"] = "timeout"
+    assert coordinator.get_verification_status("PowerSwitch") == "timeout"
