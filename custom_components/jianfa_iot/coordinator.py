@@ -1,454 +1,296 @@
-"""Data coordinator for C&D Iot integration."""
+"""Device coordinator for C&D Iot integration.
+
+Each device has its own coordinator instance that manages:
+- Device state from DataFetcher
+- Verification state for optimistic updates
+- Command sending with background verification
+"""
 
 import asyncio
 import logging
-from datetime import timedelta
-from typing import Any, Dict, Optional, Set
+from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import QUERY_INTERVAL
-from .exceptions import BatchQueryError, DeviceError, AuthenticationError
 from .http_client import HttpClient
-from .models import DeviceList, Room
+from .models import Device, Room
 
 _LOGGER = logging.getLogger(__name__)
 
+# Verification status constants
+VERIFICATION_PENDING = "pending"
+VERIFICATION_CONFIRMED = "confirmed"
+VERIFICATION_TIMEOUT = "timeout"
 
-class JianfaIotDataCoordinator(DataUpdateCoordinator[DeviceList]):
-    """Jianfa IoT Data Update Coordinator."""
+
+class DeviceCoordinator(DataUpdateCoordinator[Device]):
+    """Per-device coordinator that receives data from DataFetcher.
+
+    This coordinator does not poll the API directly. Instead, it receives
+    device data from the centralized DataFetcher and manages verification
+    state for optimistic updates.
+    """
 
     def __init__(
         self,
         hass: HomeAssistant,
         http_client: HttpClient,
         room: Room,
-        update_interval: int = QUERY_INTERVAL,
+        device_id: str,
+        device_name: str,
+        product_id: str,
     ) -> None:
-        """Initialize the coordinator."""
+        """Initialize the device coordinator."""
         super().__init__(
             hass,
             _LOGGER,
-            name="Jianfa IoT",
-            update_interval=timedelta(seconds=update_interval),
-            always_update=True,  # 确保总是通知监听者
+            name=f"Jianfa IoT {device_name}",
+            # No update_interval - we receive data from DataFetcher
+            update_interval=None,
         )
 
+        self._hass = hass
         self._http_client = http_client
-        self._room = room  # Store room config
-        self._device_ids: Set[str] = set()  # No default device ID
-        self._device_info: Dict[str, Dict[str, str]] = {}  # Store device info
+        self._room = room
+        self._device_id = device_id
+        self._device_name = device_name
+        self._product_id = product_id
 
-        # For storing the last known value separately from the data
-        self._previous_data: Dict[str, Any] = {}
+        # Verification state: {property_code: "pending" | "confirmed" | "timeout"}
+        self._verification_status: dict[str, str] = {}
 
-        # Verification state management
-        self._verification_results: Dict[str, str] = {}  # {f"{device_id}_{property}": "confirmed" | "timeout"}
+        # Verification queue and task
         self._verification_queue: asyncio.Queue = asyncio.Queue()
         self._verification_task: asyncio.Task | None = None
-        self._verification_lock = asyncio.Lock()
+
+        # Availability flag
+        self._available = True
+
+    @property
+    def device_id(self) -> str:
+        """Return the device ID."""
+        return self._device_id
+
+    @property
+    def available(self) -> bool:
+        """Return if the device is available."""
+        return self._available
+
+    async def async_update_from_fetcher(self, device: Device) -> None:
+        """Receive device data from DataFetcher.
+
+        This is called by DataFetcher when new data is available.
+        """
+        self._available = True
+        self.async_set_updated_data(device)
+        _LOGGER.debug(
+            "Device %s received update from fetcher, power=%s",
+            self._device_id,
+            device.state.power_switch if device.state else "unknown",
+        )
+
+    async def async_set_unavailable(self) -> None:
+        """Mark the device as unavailable."""
+        self._available = False
+        self.async_update_listeners()
+        _LOGGER.warning("Device %s marked as unavailable", self._device_id)
+
+    async def async_set_update_error(self, error: Exception) -> None:
+        """Handle update error from DataFetcher."""
+        _LOGGER.error("Device %s update error: %s", self._device_id, error)
+        # Don't mark unavailable on transient errors, just log
 
     @callback
-    def async_get_device_state(self, device_id: str) -> Dict[str, Any]:
-        """Get the current state of a specific device."""
-        if self.data is None:
+    def async_get_device_state(self) -> dict[str, Any]:
+        """Get the current state of the device."""
+        if self.data is None or self.data.state is None:
             return {}
 
-        for device in self.data.devices:
-            if device.device_id == device_id:
-                if device.state:
-                    return {
-                        "PowerSwitch": device.state.power_switch,
-                        "TemperatureSet": device.state.temperature_set,
-                        "WorkMode": device.state.work_mode,
-                        "Windspeed": device.state.wind_speed,
-                    }
-                return {}
-        return {}
-
-    @callback
-    def async_get_device_property(self, device_id: str, property_code: str) -> Any:
-        """Get a specific property for a device."""
-        device_state = self.async_get_device_state(device_id)
-        return device_state.get(property_code)
-
-    @callback
-    def async_get_previous_property(self, device_id: str, property_code: str) -> Any:
-        """Get the previous value of a property."""
-        device_key = f"{device_id}_{property_code}"
-        return self._previous_data.get(device_key)
-
-    async def _async_update_data(self) -> DeviceList:
-        """Fetch data from API endpoint."""
-        try:
-            # Store current data as previous
-            if self.data:
-                for device in self.data.devices:
-                    device_id = device.device_id
-                    if device.state:
-                        for property_code in [
-                            "PowerSwitch",
-                            "TemperatureSet",
-                            "WorkMode",
-                            "Windspeed",
-                        ]:
-                            value = None
-                            if property_code == "PowerSwitch":
-                                value = device.state.power_switch
-                            elif property_code == "TemperatureSet":
-                                value = device.state.temperature_set
-                            elif property_code == "WorkMode":
-                                value = device.state.work_mode
-                            elif property_code == "Windspeed":
-                                value = device.state.wind_speed
-
-                            if value is not None:
-                                device_key = f"{device_id}_{property_code}"
-                                self._previous_data[device_key] = value
-
-            # Fetch new data using room config
-            _LOGGER.debug("Fetching device data...")
-            response = await self._http_client.get_device_list(self._room)
-
-            # 添加日志记录获取到的数据
-            if response and hasattr(response, "devices") and response.devices:
-                _LOGGER.debug("Successfully fetched %d devices", len(response.devices))
-
-                # 遍历并记录每个设备的状态，便于调试
-                for device in response.devices:
-                    if device.device_id in self._device_ids:
-                        if device.state:
-                            _LOGGER.debug(
-                                "设备 %s (注册设备) 状态: %s",
-                                device.device_id,
-                                {
-                                    "PowerSwitch": device.state.power_switch,
-                                    "TemperatureSet": (
-                                        device.state.temperature_set
-                                        if hasattr(device.state, "temperature_set")
-                                        else None
-                                    ),
-                                    "WorkMode": (
-                                        device.state.work_mode
-                                        if hasattr(device.state, "work_mode")
-                                        else None
-                                    ),
-                                    "Windspeed": (
-                                        device.state.wind_speed
-                                        if hasattr(device.state, "wind_speed")
-                                        else None
-                                    ),
-                                },
-                            )
-                        else:
-                            _LOGGER.debug(
-                                "设备 %s (注册设备) 没有状态数据", device.device_id
-                            )
-            elif not response:
-                _LOGGER.warning("API返回空响应")
-            elif not hasattr(response, "devices"):
-                _LOGGER.warning("API响应缺少devices属性")
-            elif not response.devices:
-                _LOGGER.warning("API响应中devices列表为空")
-
-            return response
-
-        except AuthenticationError as error:
-            _LOGGER.error("鉴权失败，触发重新登录: %s", error)
-            # 触发标准 Reauth 流（在 setup 阶段会引导用户重新登录）
-            raise ConfigEntryAuthFailed from error
-        except BatchQueryError as error:
-            _LOGGER.error("获取设备数据失败: %s", error)
-            raise UpdateFailed(f"Error communicating with API: {error}")
-
-    async def async_send_command(
-        self, device_id: str, property_code: str, value: Any
-    ) -> bool:
-        """Send command to device.
-
-        .. deprecated::
-            Use async_send_command_with_verify instead.
-            This method does not track verification status.
-        """
-        if device_id not in self._device_ids:
-            _LOGGER.error("设备 %s 未注册到协调器", device_id)
-            return False
-
-        if device_id not in self._device_info:
-            _LOGGER.error("设备 %s 信息不完整", device_id)
-            return False
-
-        device_info = self._device_info[device_id]
-
-        try:
-            _LOGGER.debug(
-                "Sending command for property %s with value %s to device %s",
-                property_code,
-                value,
-                device_id,
-            )
-
-            # Send command with room config and device-specific information
-            success = await self._http_client.send_command(
-                room=self._room,
-                property_code=property_code,
-                value=value,
-                device_id=device_id,
-                device_name=device_info.get("device_name", ""),
-                product_id=device_info.get("product_id", ""),
-            )
-
-            if success:
-                # Trigger an immediate data update to refresh states
-                await self.async_request_refresh()
-
-                _LOGGER.debug(
-                    "Successfully sent command for property %s to %s for device %s",
-                    property_code,
-                    value,
-                    device_id,
-                )
-                return True
-
-            return False
-        except DeviceError as error:
-            _LOGGER.error(
-                "Failed to send command for property %s with value %s: %s",
-                property_code,
-                value,
-                error,
-            )
-            return False
-
-    def register_device(
-        self, device_id: str, device_name: str = "", product_id: str = ""
-    ) -> None:
-        """Register a device to be included in updates."""
-        self._device_ids.add(device_id)
-
-        # Store device info for later use in commands
-        self._device_info[device_id] = {
-            "device_name": device_name,
-            "product_id": product_id,
+        return {
+            "PowerSwitch": self.data.state.power_switch,
+            "TemperatureSet": self.data.state.temperature_set,
+            "WorkMode": self.data.state.work_mode,
+            "Windspeed": self.data.state.wind_speed,
         }
 
-        _LOGGER.debug(
-            "Registered device: %s (%s) to coordinator", device_id, device_name
-        )
-
-    def unregister_device(self, device_id: str) -> None:
-        """Unregister a device from updates."""
-        if device_id in self._device_ids:
-            self._device_ids.remove(device_id)
-
-        if device_id in self._device_info:
-            del self._device_info[device_id]
-
-        # Clean up previous data for this device
-        keys_to_remove = []
-        for key in self._previous_data:
-            if key.startswith(f"{device_id}_"):
-                keys_to_remove.append(key)
-
-        for key in keys_to_remove:
-            del self._previous_data[key]
-
     @callback
-    def get_current_data(self) -> Optional[DeviceList]:
-        """Return the current data."""
-        return self.data
+    def async_get_device_property(self, property_code: str) -> Any:
+        """Get a specific property for the device."""
+        state = self.async_get_device_state()
+        return state.get(property_code)
 
-    async def async_force_refresh(self) -> None:
-        """Force a refresh and immediately notify listeners."""
-        _LOGGER.debug("强制刷新数据并立即通知监听者")
-        await self.async_refresh()
-        # 确保即使数据没有变化，也会通知监听者
-        self.async_update_listeners()
+    def get_verification_status(self, property_code: str) -> str | None:
+        """Get verification status for a property.
 
-    async def _verification_queue_processor(self) -> None:
-        """Background task: Process verification queue sequentially.
-
-        Only one verification runs at a time to avoid API flooding.
-        Tasks are processed in FIFO order.
+        Returns:
+            "pending" - Command sent, verification in progress (ignore updates)
+            "confirmed" - Verification successful (accept updates)
+            "timeout" - Verification timed out (accept updates)
+            None - No pending verification (accept updates)
         """
-        _LOGGER.info("Verification queue processor started")
+        return self._verification_status.get(property_code)
 
-        while True:
-            # Get verification task from queue
-            device_id, property_code, expected_value = await self._verification_queue.get()
-
-            async with self._verification_lock:
-                await self._verify_with_exponential_backoff(
-                    device_id, property_code, expected_value
-                )
-
-            # Mark task as done
-            self._verification_queue.task_done()
-
-            # If queue is empty and we want to stop the processor, break here
-            # For now, keep it running indefinitely
-
-    async def _verify_with_exponential_backoff(
-        self,
-        device_id: str,
-        property_code: str,
-        expected_value: Any,
-    ) -> None:
-        """Verify device state change using exponential backoff polling.
-
-        Polls at intervals: 2s, 4s, 8s, 16s (total ~30s timeout)
-
-        Args:
-            device_id: Device identifier
-            property_code: Property being changed
-            expected_value: Expected value after command
-        """
-        key = f"{device_id}_{property_code}"
-        delays = [2, 4, 8, 16]
-
+    def set_verification_pending(self, property_code: str) -> None:
+        """Set verification status to pending for a property."""
+        self._verification_status[property_code] = VERIFICATION_PENDING
         _LOGGER.debug(
-            "Starting verification for %s: expected %s",
-            key,
-            expected_value,
+            "Device %s property %s verification set to pending",
+            self._device_id,
+            property_code,
         )
 
-        for delay in delays:
-            await asyncio.sleep(delay)
-
-            try:
-                # Force refresh to get latest state
-                await self.async_refresh()
-
-                # Check remote state
-                actual_value = self.async_get_device_property(device_id, property_code)
-
-                if actual_value == expected_value:
-                    # Verification successful
-                    self._verification_results[key] = "confirmed"
-                    _LOGGER.info(
-                        "Verification confirmed: %s = %s after %d seconds",
-                        key,
-                        expected_value,
-                        sum(delays[:delays.index(delay) + 1]),
-                    )
-                    return
-                else:
-                    _LOGGER.debug(
-                        "Verification pending for %s: expected %s, got %s",
-                        key,
-                        expected_value,
-                        actual_value,
-                    )
-
-            except Exception as e:
-                _LOGGER.warning("Verification query failed for %s: %s", key, e)
-
-        # Timeout - all delays exhausted
-        self._verification_results[key] = "timeout"
-        _LOGGER.warning(
-            "Verification timeout for %s: expected %s not confirmed after 30s",
-            key,
-            expected_value,
-        )
+    def clear_verification_status(self, property_code: str) -> None:
+        """Clear verification status for a property."""
+        if property_code in self._verification_status:
+            del self._verification_status[property_code]
 
     async def async_send_command_with_verify(
         self,
-        device_id: str,
         property_code: str,
         value: Any,
     ) -> bool:
         """Send command and start background verification.
 
         Args:
-            device_id: Device identifier
             property_code: Property to control
             value: Value to set
 
         Returns:
-            True if command was sent successfully (does not wait for verification)
+            True if command was sent successfully
         """
-        if device_id not in self._device_ids:
-            _LOGGER.error("Device %s not registered to coordinator", device_id)
-            return False
-
-        if device_id not in self._device_info:
-            _LOGGER.error("Device %s info incomplete", device_id)
-            return False
-
-        device_info = self._device_info[device_id]
-        key = f"{device_id}_{property_code}"
-
         try:
+            # Set pending status BEFORE sending command
+            self.set_verification_pending(property_code)
+
             # Send the command
             success = await self._http_client.send_command(
                 room=self._room,
                 property_code=property_code,
                 value=value,
-                device_id=device_id,
-                device_name=device_info.get("device_name", ""),
-                product_id=device_info.get("product_id", ""),
+                device_id=self._device_id,
+                device_name=self._device_name,
+                product_id=self._product_id,
             )
 
             if success:
                 # Queue verification task
-                await self._verification_queue.put((device_id, property_code, value))
+                await self._verification_queue.put((property_code, value))
 
                 # Ensure queue processor is running
                 if self._verification_task is None or self._verification_task.done():
                     self._verification_task = asyncio.create_task(
                         self._verification_queue_processor()
                     )
-                    _LOGGER.debug("Started verification queue processor")
 
                 _LOGGER.debug(
-                    "Command sent for %s, verification queued",
-                    key,
+                    "Device %s command sent for %s=%s, verification queued",
+                    self._device_id,
+                    property_code,
+                    value,
                 )
                 return True
 
+            # Command failed, clear pending status
+            self.clear_verification_status(property_code)
             return False
 
         except Exception as error:
             _LOGGER.error(
-                "Failed to send command for %s with value %s: %s",
-                key,
+                "Device %s failed to send command %s=%s: %s",
+                self._device_id,
+                property_code,
                 value,
                 error,
             )
+            self.clear_verification_status(property_code)
             return False
 
-    def is_verification_confirmed(
+    async def _verification_queue_processor(self) -> None:
+        """Background task: Process verification queue sequentially."""
+        _LOGGER.debug("Device %s verification processor started", self._device_id)
+
+        while True:
+            try:
+                property_code, expected_value = await asyncio.wait_for(
+                    self._verification_queue.get(),
+                    timeout=60.0,  # Exit if idle for 60 seconds
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.debug(
+                    "Device %s verification processor idle, exiting",
+                    self._device_id,
+                )
+                break
+
+            await self._verify_with_exponential_backoff(property_code, expected_value)
+            self._verification_queue.task_done()
+
+    async def _verify_with_exponential_backoff(
         self,
-        device_id: str,
         property_code: str,
-    ) -> bool:
-        """Check if verification has been confirmed successful.
+        expected_value: Any,
+    ) -> None:
+        """Verify device state change using exponential backoff polling.
 
-        Args:
-            device_id: Device identifier
-            property_code: Property code
-
-        Returns:
-            True if verification confirmed, False otherwise
+        Polls at intervals: 2s, 4s, 8s, 16s (total ~30s timeout)
         """
-        key = f"{device_id}_{property_code}"
-        return self._verification_results.get(key) == "confirmed"
+        delays = [2, 4, 8, 16]
 
-    def get_verification_status(
-        self,
-        device_id: str,
-        property_code: str,
-    ) -> str | None:
-        """Get verification status for a device property.
+        _LOGGER.debug(
+            "Device %s starting verification for %s: expected %s",
+            self._device_id,
+            property_code,
+            expected_value,
+        )
 
-        Args:
-            device_id: Device identifier
-            property_code: Property code
+        for delay in delays:
+            await asyncio.sleep(delay)
 
-        Returns:
-            "confirmed" | "timeout" | None (not yet verified)
-        """
-        key = f"{device_id}_{property_code}"
-        return self._verification_results.get(key)
+            # Check current state from coordinator data
+            actual_value = self.async_get_device_property(property_code)
+
+            if actual_value == expected_value:
+                self._verification_status[property_code] = VERIFICATION_CONFIRMED
+                _LOGGER.info(
+                    "Device %s verification confirmed: %s=%s",
+                    self._device_id,
+                    property_code,
+                    expected_value,
+                )
+                # Notify listeners that verification is complete
+                self.async_update_listeners()
+                return
+
+            _LOGGER.debug(
+                "Device %s verification pending: %s expected %s, got %s",
+                self._device_id,
+                property_code,
+                expected_value,
+                actual_value,
+            )
+
+        # Timeout
+        self._verification_status[property_code] = VERIFICATION_TIMEOUT
+        _LOGGER.warning(
+            "Device %s verification timeout: %s=%s not confirmed",
+            self._device_id,
+            property_code,
+            expected_value,
+        )
+        # Notify listeners that verification timed out
+        self.async_update_listeners()
+
+    async def async_shutdown(self) -> None:
+        """Shutdown the coordinator."""
+        if self._verification_task is not None:
+            self._verification_task.cancel()
+            try:
+                await self._verification_task
+            except asyncio.CancelledError:
+                pass
+            self._verification_task = None
+
+
+# Keep old name as alias for backwards compatibility during migration
+JianfaIotDataCoordinator = DeviceCoordinator
