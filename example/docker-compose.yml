@@ -1,4 +1,12 @@
-version: '3.8'
+# Home Assistant Docker Compose for C&D IoT Integration Testing
+#
+# Default credentials:
+#   Username: admin
+#   Password: admin
+#
+# Quick start:
+#   docker-compose up -d
+#   Open http://localhost:8123
 
 services:
   homeassistant:
