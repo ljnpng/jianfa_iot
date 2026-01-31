@@ -97,3 +97,4 @@ credentials.json
 
 # Example Home Assistant data
 example/ha_data/home-assistant.log*
+example/e2e_progress.json
