@@ -14,7 +14,7 @@ from .const import (
     MANUFACTURER,
     MODEL_LIGHT,
 )
-from .coordinator import JianfaIotDataCoordinator
+from .coordinator import DeviceCoordinator
 from .models import Room
 from . import JianfaIotConfigEntry
 
@@ -35,7 +35,7 @@ async def async_setup_entry(
     # Get data from runtime_data
     data = entry.runtime_data
     devices = data.devices
-    coordinator = data.coordinator
+    coordinators = data.coordinators
     room = data.room_config
 
     _LOGGER.info("Processing devices for light setup")
@@ -46,6 +46,15 @@ async def async_setup_entry(
 
     for device in light_devices:
         try:
+            # Get the coordinator for this device
+            coordinator = coordinators.get(device.device_id)
+            if not coordinator:
+                _LOGGER.error(
+                    "No coordinator found for light device %s",
+                    device.device_id,
+                )
+                continue
+
             _LOGGER.info(
                 "Creating light entity: id=%s, name=%s",
                 device.device_id,
@@ -77,12 +86,12 @@ async def async_setup_entry(
         _LOGGER.warning("No light entities found")
 
 
-class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
+class HisenseLight(CoordinatorEntity[DeviceCoordinator], LightEntity):
     """Representation of a HISENSE light."""
 
     def __init__(
         self,
-        coordinator: JianfaIotDataCoordinator,
+        coordinator: DeviceCoordinator,
         room: Room,
         name: str,
         device_id: str,
@@ -125,17 +134,21 @@ class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
 
     def _update_state_from_coordinator(self) -> None:
         """Update state from coordinator data."""
-        coordinator = cast(JianfaIotDataCoordinator, self.coordinator)
+        coordinator = cast(DeviceCoordinator, self.coordinator)
 
         if coordinator.data is None:
             _LOGGER.warning("Coordinator data is empty")
             return
 
         # Get device state
-        state = coordinator.async_get_device_property(self._device_id, PROPERTY_POWER)
+        state = coordinator.async_get_device_property(PROPERTY_POWER)
 
         if state is not None:
-            self._attr_is_on = bool(state)
+            # Handle string "0"/"1" and int 0/1
+            if isinstance(state, str):
+                self._attr_is_on = state == "1"
+            else:
+                self._attr_is_on = bool(state)
             _LOGGER.debug(
                 "Updated light %s state to: %s",
                 self._device_id,
@@ -154,7 +167,7 @@ class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
             )
             return
 
-        coordinator = cast(JianfaIotDataCoordinator, self.coordinator)
+        coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update - update UI immediately
         _LOGGER.debug("Turning on light %s", self._device_id)
@@ -162,9 +175,15 @@ class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
         self.async_write_ha_state()
 
         # Send command with background verification
-        await coordinator.async_send_command_with_verify(
-            self._device_id, PROPERTY_POWER, 1
+        success = await coordinator.async_send_command_with_verify(
+            PROPERTY_POWER, 1
         )
+
+        if not success:
+            # Rollback on failure
+            self._attr_is_on = False
+            self.async_write_ha_state()
+            _LOGGER.error("Failed to turn on light %s", self._device_id)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
@@ -176,7 +195,7 @@ class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
             )
             return
 
-        coordinator = cast(JianfaIotDataCoordinator, self.coordinator)
+        coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update - update UI immediately
         _LOGGER.debug("Turning off light %s", self._device_id)
@@ -184,22 +203,19 @@ class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
         self.async_write_ha_state()
 
         # Send command with background verification
-        await coordinator.async_send_command_with_verify(
-            self._device_id, PROPERTY_POWER, 0
+        success = await coordinator.async_send_command_with_verify(
+            PROPERTY_POWER, 0
         )
+
+        if not success:
+            # Rollback on failure
+            self._attr_is_on = True
+            self.async_write_ha_state()
+            _LOGGER.error("Failed to turn off light %s", self._device_id)
 
     async def async_update(self) -> None:
         """Update the entity."""
         _LOGGER.debug("Manual update for light %s", self._device_id)
-
-        coordinator = cast(JianfaIotDataCoordinator, self.coordinator)
-
-        # Force refresh and update
-        if hasattr(coordinator, "async_force_refresh"):
-            await coordinator.async_force_refresh()
-        else:
-            await coordinator.async_request_refresh()
-
         self._update_state_from_coordinator()
         self.async_write_ha_state()
 
@@ -232,47 +248,56 @@ class HisenseLight(CoordinatorEntity[JianfaIotDataCoordinator], LightEntity):
             self._device_id,
         )
 
-        coordinator = cast(JianfaIotDataCoordinator, self.coordinator)
+        coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Check verification status before accepting update
-        verification_status = coordinator.get_verification_status(
-            self._device_id, PROPERTY_POWER
-        )
+        verification_status = coordinator.get_verification_status(PROPERTY_POWER)
 
-        # If verification is still pending or hasn't started, ignore update
-        if verification_status is None:
+        # NEW LOGIC:
+        # - None: No pending verification -> ACCEPT update (physical button sync)
+        # - "pending": Verification in progress -> IGNORE update (protect optimistic state)
+        # - "confirmed"/"timeout": Verification complete -> ACCEPT update
+
+        if verification_status == "pending":
             _LOGGER.debug(
-                "Skipping coordinator update for %s: verification not started",
+                "Skipping coordinator update for %s: verification pending",
                 self._device_id,
             )
             return
 
-        # If verification confirmed, accept the update
-        if verification_status == "confirmed":
+        # Accept update for None, "confirmed", or "timeout"
+        if verification_status is None:
+            _LOGGER.debug(
+                "Accepting coordinator update for %s: no pending verification",
+                self._device_id,
+            )
+        elif verification_status == "confirmed":
             _LOGGER.debug(
                 "Accepting coordinator update for %s: verification confirmed",
                 self._device_id,
             )
-            old_state = self._attr_is_on
-            self._update_state_from_coordinator()
-            new_state = self._attr_is_on
+        else:  # timeout
+            _LOGGER.debug(
+                "Accepting coordinator update for %s: verification timed out",
+                self._device_id,
+            )
 
-            if old_state != new_state:
-                _LOGGER.debug(
-                    "Light %s state updated: %s -> %s",
-                    self._device_id,
-                    "ON" if old_state else "OFF",
-                    "ON" if new_state else "OFF",
-                )
-
-            self.async_write_ha_state()
-            return
-
-        # If verification timed out, still update but log warning
-        # (maintain optimistic state but eventually sync)
-        _LOGGER.debug(
-            "Accepting coordinator update for %s: verification timed out, syncing to actual state",
-            self._device_id,
-        )
+        old_state = self._attr_is_on
         self._update_state_from_coordinator()
+        new_state = self._attr_is_on
+
+        if old_state != new_state:
+            _LOGGER.debug(
+                "Light %s state updated: %s -> %s",
+                self._device_id,
+                "ON" if old_state else "OFF",
+                "ON" if new_state else "OFF",
+            )
+
         self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+        return coordinator.available

@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
@@ -25,7 +25,7 @@ from .const import (
     MANUFACTURER,
     MODEL_AIRCONDITION,
 )
-from .coordinator import JianfaIotDataCoordinator
+from .coordinator import DeviceCoordinator
 from .models import Room
 from . import JianfaIotConfigEntry
 
@@ -92,7 +92,7 @@ async def async_setup_entry(
     # Get data from runtime_data
     data = entry.runtime_data
     devices = data.devices
-    coordinator = data.coordinator
+    coordinators = data.coordinators
     room = data.room_config
 
     _LOGGER.info("Processing devices for climate setup")
@@ -103,6 +103,15 @@ async def async_setup_entry(
 
     for device in climate_devices:
         try:
+            # Get the coordinator for this device
+            coordinator = coordinators.get(device.device_id)
+            if not coordinator:
+                _LOGGER.error(
+                    "No coordinator found for climate device %s",
+                    device.device_id,
+                )
+                continue
+
             _LOGGER.info(
                 "Creating climate entity: id=%s, name=%s",
                 device.device_id,
@@ -134,7 +143,7 @@ async def async_setup_entry(
         _LOGGER.warning("No climate entities found")
 
 
-class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity):
+class HisenseClimate(CoordinatorEntity[DeviceCoordinator], ClimateEntity):
     """Representation of a HISENSE air conditioner."""
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -145,7 +154,7 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
 
     def __init__(
         self,
-        coordinator: JianfaIotDataCoordinator,
+        coordinator: DeviceCoordinator,
         room: Room,
         name: str,
         device_id: str,
@@ -193,16 +202,16 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         self._attr_current_temperature = None
         self._attr_target_temperature = 25
 
-        # 状态管理 - 确保所有变量都在初始化时正确定义
-        self._local_state = {  # 本地状态跟踪
-            PROPERTY_POWER: None,  # Can be bool
-            PROPERTY_MODE: None,  # Can be int
-            PROPERTY_TEMPERATURE: None,  # Can be float
-            PROPERTY_FAN_SPEED: None,  # Can be int
-        }  # type: dict[str, Any]
+        # 状态管理
+        self._local_state: dict[str, Any] = {
+            PROPERTY_POWER: None,
+            PROPERTY_MODE: None,
+            PROPERTY_TEMPERATURE: None,
+            PROPERTY_FAN_SPEED: None,
+        }
 
-        self._update_lock = asyncio.Lock()  # 更新锁
-        self._is_updating = False  # 正在更新标志
+        self._update_lock = asyncio.Lock()
+        self._is_updating = False
 
         # 初始化状态后，尝试从协调器更新
         self._async_update_from_coordinator()
@@ -215,7 +224,13 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
             self._device_id,
         )
 
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         # Check if any property has pending verification
+        # NEW LOGIC:
+        # - None: No pending verification -> ACCEPT update (physical button sync)
+        # - "pending": Verification in progress -> IGNORE update (protect optimistic state)
+        # - "confirmed"/"timeout": Verification complete -> ACCEPT update
         has_pending = False
         for property_code in [
             PROPERTY_POWER,
@@ -223,10 +238,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
             PROPERTY_TEMPERATURE,
             PROPERTY_FAN_SPEED,
         ]:
-            status = self.coordinator.get_verification_status(
-                self._device_id, property_code
-            )
-            if status is None:  # Verification not started or in progress
+            status = coordinator.get_verification_status(property_code)
+            if status == "pending":
                 has_pending = True
                 _LOGGER.debug(
                     "Property %s has pending verification for device %s",
@@ -236,16 +249,15 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
                 break
 
         if has_pending:
-            # Has pending verifications, skip update to maintain optimistic state
             _LOGGER.debug(
                 "Skipping coordinator update for %s: pending verifications",
                 self._device_id,
             )
             return
 
-        # All verifications complete (confirmed or timeout), accept update
+        # Accept update for None, "confirmed", or "timeout"
         _LOGGER.debug(
-            "Accepting coordinator update for %s: all verifications complete",
+            "Accepting coordinator update for %s: no pending verifications",
             self._device_id,
         )
 
@@ -269,7 +281,7 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
             _LOGGER.debug(
                 "Climate %s state updated: %s -> %s",
                 self._device_id,
-                old_state,
+             old_state,
                 new_state,
             )
 
@@ -278,10 +290,10 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
     @callback
     def _async_update_from_coordinator(self) -> None:
         """Update attributes based on coordinator data."""
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         # Get power state
-        power_state = self.coordinator.async_get_device_property(
-            self._device_id, PROPERTY_POWER
-        )
+        power_state = coordinator.async_get_device_property(PROPERTY_POWER)
 
         if power_state is not None:
             power_bool = bool(power_state)
@@ -294,26 +306,20 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
 
         # Device is on, update other properties
         # Mode
-        mode = self.coordinator.async_get_device_property(
-            self._device_id, PROPERTY_MODE
-        )
+        mode = coordinator.async_get_device_property(PROPERTY_MODE)
         if mode is not None and mode in HISENSE_TO_HVAC_MODE:
             self._local_state[PROPERTY_MODE] = mode
             self._attr_hvac_mode = HISENSE_TO_HVAC_MODE[mode]
             self._update_hvac_action()
 
         # Temperature
-        temp = self.coordinator.async_get_device_property(
-            self._device_id, PROPERTY_TEMPERATURE
-        )
+        temp = coordinator.async_get_device_property(PROPERTY_TEMPERATURE)
         if temp is not None:
             self._local_state[PROPERTY_TEMPERATURE] = float(temp)
             self._attr_target_temperature = float(temp)
 
         # Fan speed
-        fan_speed = self.coordinator.async_get_device_property(
-            self._device_id, PROPERTY_FAN_SPEED
-        )
+        fan_speed = coordinator.async_get_device_property(PROPERTY_FAN_SPEED)
         if fan_speed is not None and fan_speed in HISENSE_TO_FAN_MODE:
             self._local_state[PROPERTY_FAN_SPEED] = fan_speed
             self._attr_fan_mode = HISENSE_TO_FAN_MODE[fan_speed]
@@ -335,19 +341,19 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
 
     async def _async_ensure_device_on(self) -> bool:
         """Ensure device is turned on before setting other properties."""
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         if self._attr_hvac_mode == HVACMode.OFF:
             _LOGGER.debug(
                 "Turning ON device %s before setting properties", self._device_id
             )
 
             # 发送开机命令
-            if not await self.coordinator.async_send_command_with_verify(
-                self._device_id, PROPERTY_POWER, 1
-            ):
+            if not await coordinator.async_send_command_with_verify(PROPERTY_POWER, 1):
                 _LOGGER.error("Failed to turn ON device %s", self._device_id)
                 return False
 
-            # 更新内部状态以立即反映UI变化（提高响应速度）
+            # 更新内部状态以立即反映UI变化
             self._attr_hvac_mode = HVACMode.COOL  # 默认模式
             self._update_hvac_action()
             self._local_state[PROPERTY_POWER] = True
@@ -358,28 +364,13 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
 
         return True
 
-    async def _async_refresh_state(self) -> None:
-        """Refresh device state with debounce protection."""
-        async with self._update_lock:
-            if self._is_updating:
-                _LOGGER.debug(
-                    "State refresh already in progress for %s", self._device_id
-                )
-                return
-
-            try:
-                self._is_updating = True
-                await self.coordinator.async_request_refresh()
-            except Exception as err:
-                _LOGGER.error("Error refreshing state for %s: %s", self._device_id, err)
-            finally:
-                self._is_updating = False
-
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the climate device on."""
         if self._attr_hvac_mode != HVACMode.OFF:
             _LOGGER.debug("Device %s is already ON", self._device_id)
             return
+
+        coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update
         _LOGGER.debug("Turning on device %s", self._device_id)
@@ -390,9 +381,7 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         self.async_write_ha_state()
 
         # Send command with verification
-        success = await self.coordinator.async_send_command_with_verify(
-            self._device_id, PROPERTY_POWER, 1
-        )
+        success = await coordinator.async_send_command_with_verify(PROPERTY_POWER, 1)
 
         if not success:
             # Revert on failure
@@ -408,6 +397,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
             _LOGGER.debug("Device %s is already OFF", self._device_id)
             return
 
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         # Optimistic update
         _LOGGER.debug("Turning off device %s", self._device_id)
         old_mode = self._attr_hvac_mode
@@ -417,9 +408,7 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         self.async_write_ha_state()
 
         # Send command with verification
-        success = await self.coordinator.async_send_command_with_verify(
-            self._device_id, PROPERTY_POWER, 0
-        )
+        success = await coordinator.async_send_command_with_verify(PROPERTY_POWER, 0)
 
         if not success:
             # Revert on failure
@@ -444,6 +433,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         if not await self._async_ensure_device_on():
             return
 
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         # Change mode
         if hvac_mode in HVAC_MODE_TO_HISENSE:
             hisense_mode = HVAC_MODE_TO_HISENSE[hvac_mode]
@@ -461,8 +452,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
             self.async_write_ha_state()
 
             # Send command with verification
-            success = await self.coordinator.async_send_command_with_verify(
-                self._device_id, PROPERTY_MODE, hisense_mode
+            success = await coordinator.async_send_command_with_verify(
+                PROPERTY_MODE, hisense_mode
             )
 
             if not success:
@@ -488,6 +479,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         if not await self._async_ensure_device_on():
             return
 
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         # Change fan speed
         if fan_mode in FAN_MODE_TO_HISENSE:
             hisense_fan_speed = FAN_MODE_TO_HISENSE[fan_mode]
@@ -504,8 +497,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
             self.async_write_ha_state()
 
             # Send command with verification
-            success = await self.coordinator.async_send_command_with_verify(
-                self._device_id, PROPERTY_FAN_SPEED, hisense_fan_speed
+            success = await coordinator.async_send_command_with_verify(
+                PROPERTY_FAN_SPEED, hisense_fan_speed
             )
 
             if not success:
@@ -541,6 +534,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         if not await self._async_ensure_device_on():
             return
 
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+
         # Optimistic update
         _LOGGER.debug(
             "Setting temperature for device %s to %s",
@@ -553,8 +548,8 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
         self.async_write_ha_state()
 
         # Send command with verification
-        success = await self.coordinator.async_send_command_with_verify(
-            self._device_id, PROPERTY_TEMPERATURE, temperature
+        success = await coordinator.async_send_command_with_verify(
+            PROPERTY_TEMPERATURE, temperature
         )
 
         if not success:
@@ -574,6 +569,11 @@ class HisenseClimate(CoordinatorEntity[JianfaIotDataCoordinator], ClimateEntity)
     async def async_update(self) -> None:
         """Update the entity."""
         _LOGGER.debug("Manual update for climate %s", self._device_id)
+        self._async_update_from_coordinator()
+        self.async_write_ha_state()
 
-        # Use standard refresh
-        await self.coordinator.async_request_refresh()
+    @property
+    def available(self) -> bool:
+        """Return if entity is available."""
+        coordinator = cast(DeviceCoordinator, self.coordinator)
+        return coordinator.available

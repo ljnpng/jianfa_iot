@@ -1,6 +1,8 @@
 """The C&D Iot integration."""
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 import logging
 from homeassistant.config_entries import ConfigEntry
@@ -8,7 +10,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
-from .coordinator import JianfaIotDataCoordinator
+from .coordinator import DeviceCoordinator
+from .data_fetcher import DataFetcher
 from .http_client import HttpClient
 from .auth_client import AuthClient
 from .models import Device, Room
@@ -16,16 +19,22 @@ from .models import Device, Room
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["light", "climate"]
 
-# Type alias for ConfigEntry with runtime data
-type JianfaIotConfigEntry = ConfigEntry[JianfaIotData]
 
 @dataclass
 class JianfaIotData:
     """Runtime data for the integration."""
     http_client: HttpClient
-    coordinator: JianfaIotDataCoordinator
+    data_fetcher: DataFetcher
+    coordinators: dict[str, DeviceCoordinator]
     room_config: Room
     devices: list[Device]
+
+
+if TYPE_CHECKING:
+    # Type alias for ConfigEntry with runtime data
+    JianfaIotConfigEntry = ConfigEntry[JianfaIotData]
+else:
+    JianfaIotConfigEntry = ConfigEntry
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
@@ -65,13 +74,15 @@ async def async_setup_entry(
         room_config = room_list.first_room
         _LOGGER.info("Using room: %s", room_config.room_name)
 
-        # Get device list
-        try:
-            device_list = await http_client.get_device_list(room_config)
-            devices = device_list.devices if device_list else []
-        except Exception as error:
-            _LOGGER.warning("Error getting device list, will retry: %s", error)
-            devices = []
+        # Create DataFetcher
+        data_fetcher = DataFetcher(hass, http_client, room_config)
+
+        # Fetch initial device list
+        device_list = await data_fetcher.async_fetch_once()
+        devices = device_list.devices if device_list else []
+
+        if not devices:
+            _LOGGER.warning("No devices found, will retry on next poll")
 
         # Log devices
         for device in devices:
@@ -82,24 +93,36 @@ async def async_setup_entry(
                 device.product_id,
             )
 
-        # Create coordinator
-        coordinator = JianfaIotDataCoordinator(hass, http_client, room_config)
-
-        # Register devices
+        # Create per-device coordinators
+        coordinators: dict[str, DeviceCoordinator] = {}
         for device in devices:
-            coordinator.register_device(
+            coordinator = DeviceCoordinator(
+                hass=hass,
+                http_client=http_client,
+                room=room_config,
                 device_id=device.device_id,
                 device_name=device.device_name,
                 product_id=device.product_id,
             )
+            coordinators[device.device_id] = coordinator
 
-        # Refresh coordinator
-        await coordinator.async_config_entry_first_refresh()
+            # Register coordinator with data fetcher
+            data_fetcher.register_coordinator(device.device_id, coordinator)
+
+            _LOGGER.debug(
+                "Created coordinator for device: %s (%s)",
+                device.device_id,
+                device.device_name,
+            )
+
+        # Start data fetcher polling
+        await data_fetcher.async_start()
 
         # Store in runtime_data (NEW HA 2024 pattern)
         entry.runtime_data = JianfaIotData(
             http_client=http_client,
-            coordinator=coordinator,
+            data_fetcher=data_fetcher,
+            coordinators=coordinators,
             room_config=room_config,
             devices=devices,
         )
@@ -120,9 +143,17 @@ async def async_unload_entry(
     entry: JianfaIotConfigEntry,
 ) -> bool:
     """Unload a config entry."""
+    # Stop data fetcher
+    if entry.runtime_data and entry.runtime_data.data_fetcher:
+        await entry.runtime_data.data_fetcher.async_stop()
+
+    # Shutdown coordinators
+    if entry.runtime_data and entry.runtime_data.coordinators:
+        for coordinator in entry.runtime_data.coordinators.values():
+            await coordinator.async_shutdown()
+
     unload_ok = await hass.config_entries.async_unload_platforms(
         entry, PLATFORMS
     )
 
-    # runtime_data is automatically cleaned up by HA
     return unload_ok
