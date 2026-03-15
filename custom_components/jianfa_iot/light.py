@@ -159,14 +159,6 @@ class HisenseLight(CoordinatorEntity[DeviceCoordinator], LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
-        # Debounce: if already on locally, skip
-        if self._attr_is_on:
-            _LOGGER.debug(
-                "Light %s is already ON locally, skipping",
-                self._device_id,
-            )
-            return
-
         coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update - update UI immediately
@@ -187,14 +179,6 @@ class HisenseLight(CoordinatorEntity[DeviceCoordinator], LightEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
-        # Debounce: if already off locally, skip
-        if not self._attr_is_on:
-            _LOGGER.debug(
-                "Light %s is already OFF locally, skipping",
-                self._device_id,
-            )
-            return
-
         coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update - update UI immediately

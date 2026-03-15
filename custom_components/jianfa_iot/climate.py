@@ -366,10 +366,6 @@ class HisenseClimate(CoordinatorEntity[DeviceCoordinator], ClimateEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the climate device on."""
-        if self._attr_hvac_mode != HVACMode.OFF:
-            _LOGGER.debug("Device %s is already ON", self._device_id)
-            return
-
         coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update
@@ -393,10 +389,6 @@ class HisenseClimate(CoordinatorEntity[DeviceCoordinator], ClimateEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the climate device off."""
-        if self._attr_hvac_mode == HVACMode.OFF:
-            _LOGGER.debug("Device %s is already OFF", self._device_id)
-            return
-
         coordinator = cast(DeviceCoordinator, self.coordinator)
 
         # Optimistic update
@@ -423,10 +415,6 @@ class HisenseClimate(CoordinatorEntity[DeviceCoordinator], ClimateEntity):
         # Handle OFF
         if hvac_mode == HVACMode.OFF:
             await self.async_turn_off()
-            return
-
-        # Skip if same mode
-        if hvac_mode == self._attr_hvac_mode:
             return
 
         # Ensure device is on
@@ -471,10 +459,6 @@ class HisenseClimate(CoordinatorEntity[DeviceCoordinator], ClimateEntity):
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode."""
-        # Skip if same mode
-        if fan_mode == self._attr_fan_mode:
-            return
-
         # Ensure device is on
         if not await self._async_ensure_device_on():
             return
@@ -525,10 +509,6 @@ class HisenseClimate(CoordinatorEntity[DeviceCoordinator], ClimateEntity):
         temperature = max(
             min(int(temperature), self._attr_max_temp), self._attr_min_temp
         )
-
-        # Skip if same temperature
-        if temperature == self._attr_target_temperature:
-            return
 
         # Ensure device is on
         if not await self._async_ensure_device_on():
